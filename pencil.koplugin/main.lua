@@ -744,6 +744,7 @@ function Pencil:endRawStroke()
             self.current_stroke and #self.current_stroke.points or 0))
     end
     if self.current_stroke and #self.current_stroke.points >= 1 then
+        self:anchorStroke(self.current_stroke)
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
         table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
@@ -1216,6 +1217,20 @@ function Pencil:addToMainMenu(menu_items)
                 end,
                 enabled_func = function()
                     return self:hasStrokesOnCurrentPage()
+                end,
+            },
+            {
+                text = _("Anchor this page's ink to the view"),
+                help_text = _("Ink written with an earlier version stays where it was on the screen when you zoom or scroll. With the page shown as it was when you wrote on it, this makes that ink follow the page from now on."),
+                callback = function()
+                    local count = self:anchorVisibleStrokes()
+                    UIManager:show(InfoMessage:new{
+                        text = T(_("%1 strokes now follow the page."), count),
+                        timeout = 3,
+                    })
+                end,
+                enabled_func = function()
+                    return self:hasUnanchoredVisibleStrokes()
                 end,
             },
             {
@@ -2862,6 +2877,7 @@ function Pencil:onDrawPanRelease(ges)
     -- Fallback: finalize stroke via gesture system
     if #self.current_stroke.points >= 1 then
         -- Finalize the stroke
+        self:anchorStroke(self.current_stroke)
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
         self:saveStrokes()
@@ -3623,7 +3639,8 @@ function Pencil:getStaleGroupsForCurrentView()
         local gpage = self:getGroupCurrentPage(group)
         if gpage == page then
             if group.image_rotation == nil
-                    or group.image_rotation == current_rot then
+                    or group.image_rotation == current_rot
+                    or self:groupIsAnchored(group) then
                 has_native = true
             elseif group.image_path then
                 stale = stale or {}
@@ -3765,6 +3782,110 @@ function Pencil:installBookmarkHook()
 
     _bookmark_hook_installed = true
     logger.info("Pencil: installed bookmark list hook")
+end
+
+-- ── Page anchoring (fixed layout documents) ──────────────────────────────
+-- Strokes are drawn, hit-tested and refreshed in screen pixels. On a paged
+-- document (PDF, DjVu, CBZ...) that alone pins the ink to the screen: zoom,
+-- pan or scroll, and the page moves under it. So each stroke also keeps its
+-- points in page coordinates (the document's native units, as ReaderView
+-- maps them), and its screen points are worked out again from those for
+-- wherever its page sits now. Reflowable documents keep the screen points.
+
+--- Where the visible pages sit on screen, or nil outside a paged document.
+function Pencil:pagePlacements()
+    if not (self.ui and self.ui.paging and self.view) then return nil end
+    local placements = PencilGeometry.pagePlacements(self.view)
+    if #placements == 0 then return nil end
+    return placements
+end
+
+--- The page under a screen point (the one an eraser or a stroke start hits),
+--- or nil outside a paged document.
+function Pencil:pageAtScreen(_x, y)
+    local placements = self:pagePlacements()
+    local pl = placements and PencilGeometry.placementAt(placements, y)
+    return pl and pl.page
+end
+
+--- Anchor a stroke's screen points to the page under its first point. In
+--- continuous mode that page also becomes the stroke's page: the current
+--- page is just the topmost one on screen.
+function Pencil:anchorStroke(stroke, pl)
+    if not stroke or not stroke.points or #stroke.points == 0 then return false end
+    if not pl then
+        local placements = self:pagePlacements()
+        pl = placements and PencilGeometry.placementAt(placements, stroke.points[1].y)
+    end
+    if not pl then return false end
+    stroke.page = pl.page
+    stroke.page_p = PencilGeometry.screenToPage(stroke.points, pl)
+    stroke.page_rot = pl.rotation
+    stroke._view_key = PencilGeometry.placementKey(pl)
+    return true
+end
+
+--- Bring the screen points of the anchored strokes of every visible page up
+--- to date with where that page sits now. Cheap when nothing moved.
+function Pencil:refreshAnchoredStrokes(placements)
+    for _, pl in ipairs(placements) do
+        local key = PencilGeometry.placementKey(pl)
+        for _, idx in ipairs(self.page_strokes[pl.page] or {}) do
+            local stroke = self.strokes[idx]
+            -- A page shown with another rotation keeps the screen points.
+            if stroke and stroke.page_p and stroke._view_key ~= key and stroke.page_rot == pl.rotation then
+                stroke.points = PencilGeometry.pageToScreen(stroke.page_p, pl)
+                stroke._view_key = key
+            end
+        end
+    end
+end
+
+--- True when every stroke of an annotation group follows its page, so it
+--- draws in the right place at any screen rotation.
+function Pencil:groupIsAnchored(group)
+    if not (self.ui and self.ui.paging) or not group.stroke_indices or #group.stroke_indices == 0 then
+        return false
+    end
+    for _, idx in ipairs(group.stroke_indices) do
+        local stroke = self.strokes[idx]
+        if not (stroke and stroke.page_p) then return false end
+    end
+    return true
+end
+
+--- Anchor the strokes written before page anchoring existed (or with a
+--- version without it) on the visible pages, as they are shown now. For ink
+--- that shows in the right place in the current view. Returns how many.
+function Pencil:anchorVisibleStrokes()
+    local placements = self:pagePlacements()
+    if not placements then return 0 end
+    local count = 0
+    for _, pl in ipairs(placements) do
+        for _, idx in ipairs(self.page_strokes[pl.page] or {}) do
+            local stroke = self.strokes[idx]
+            if stroke and not stroke.page_p and self:anchorStroke(stroke, pl) then
+                count = count + 1
+            end
+        end
+    end
+    if count > 0 then
+        self:saveStrokes()
+    end
+    return count
+end
+
+--- True when a visible page has strokes that don't follow it yet.
+function Pencil:hasUnanchoredVisibleStrokes()
+    local placements = self:pagePlacements()
+    if not placements then return false end
+    for _, pl in ipairs(placements) do
+        for _, idx in ipairs(self.page_strokes[pl.page] or {}) do
+            local stroke = self.strokes[idx]
+            if stroke and not stroke.page_p then return true end
+        end
+    end
+    return false
 end
 
 -- Rebuild page index from strokes
@@ -3928,7 +4049,9 @@ end
 -- Erase strokes at a given point
 -- Returns array of deleted strokes (for undo), or nil if none
 function Pencil:eraseAtPoint(x, y, page)
-    -- Only erase strokes on the current page
+    -- Only erase strokes on the page under the eraser: in continuous mode
+    -- that isn't always the current (topmost) page.
+    page = self:pageAtScreen(x, y) or page
     if self.input_debug_mode then
         self:writeDebugLog(string.format("ERASE: searching %d strokes at (%d, %d)",
             #self.strokes, x, y))
@@ -4045,6 +4168,13 @@ function Pencil:paintTo(bb, x, y)
     local page = self:getCurrentPage()
     local current_rot = Screen:getRotationMode()
 
+    -- Paged documents: move the ink of every visible page to where the page
+    -- sits now (zoom, pan, continuous scroll).
+    local placements = self:pagePlacements()
+    if placements then
+        self:refreshAnchoredStrokes(placements)
+    end
+
     -- Backfill XPointers for legacy groups before we filter, so the
     -- rotation-aware page resolution below sees them.
     self:backfillGroupXPointers()
@@ -4073,7 +4203,8 @@ function Pencil:paintTo(bb, x, y)
                 groups_with_image = groups_with_image + 1
             end
             if group.image_rotation == nil
-                    or group.image_rotation == current_rot then
+                    or group.image_rotation == current_rot
+                    or self:groupIsAnchored(group) then
                 -- Renders natively (same rotation as capture, or legacy group
                 -- without rotation info — render strokes as-is).
                 has_native_annotation = true
@@ -4122,6 +4253,20 @@ function Pencil:paintTo(bb, x, y)
             local stroke = self.strokes[idx]
             if stroke then
                 self:renderStroke(bb, stroke)
+            end
+        end
+    end
+
+    -- Continuous mode shows more pages than the current one: draw theirs too.
+    if placements and #placements > 1 then
+        for _, pl in ipairs(placements) do
+            if pl.page ~= page then
+                for _, idx in ipairs(self.page_strokes[pl.page] or {}) do
+                    local stroke = self.strokes[idx]
+                    if stroke then
+                        self:renderStroke(bb, stroke)
+                    end
+                end
             end
         end
     end
@@ -4318,6 +4463,11 @@ function Pencil:strokeToSaveable(stroke)
         -- array of {x=,y=} tables, so the serializer doesn't walk every point.
         p = PencilGeometry.packPoints(stroke.points),
         color_name = stroke.color_name,  -- Save color name for persistence
+        -- Paged documents: the same points in page coordinates, which the
+        -- screen points follow (see "Page anchoring"). Versions without it
+        -- ignore these and draw `p`, the screen points of the last view.
+        page_p = stroke.page_p and PencilGeometry.packPagePoints(stroke.page_p) or nil,
+        page_rot = stroke.page_p and stroke.page_rot or nil,
     }
 end
 
@@ -4356,6 +4506,9 @@ function Pencil:strokeFromSaved(saved)
         alpha = saved.alpha or tool_settings.alpha,
         datetime = saved.datetime,
         points = points,
+        page_p = (type(saved.page_p) == "string" and saved.page_p ~= "")
+            and PencilGeometry.unpackPoints(saved.page_p) or nil,
+        page_rot = saved.page_rot,
     }
 end
 

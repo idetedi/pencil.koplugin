@@ -99,6 +99,121 @@ function Geometry.unpackPoints(str)
     return points
 end
 
+--- Like packPoints, with at most 2 decimals: page coordinates are in the
+--- document's native units (points for a PDF), where one unit spans several
+--- screen pixels once zoomed, so they can't be rounded to integers.
+-- @param points array of {x=, y=} (may be nil/empty)
+-- @return string space-separated coordinates ("" when empty)
+local function round2(v)
+    local s = string.format("%.2f", v or 0):gsub("%.?0+$", "")
+    if s == "" or s == "-" or s == "-0" then return "0" end
+    return s
+end
+function Geometry.packPagePoints(points)
+    if not points or #points == 0 then return "" end
+    local buf = {}
+    for i = 1, #points do
+        buf[2 * i - 1] = round2(points[i].x)
+        buf[2 * i] = round2(points[i].y)
+    end
+    return table.concat(buf, " ")
+end
+
+--- Where each visible page of a paged (fixed layout) view sits on screen.
+--- Mirrors ReaderView:getSinglePagePosition/getScrollPagePosition and their
+--- Rect counterparts, without their visibility checks, so a stroke that runs
+--- past an edge still maps whole. A page point (px, py) shows on screen at
+--- (ox + px * zoom, oy + py * zoom). top/bottom bound the page's band on
+--- screen in continuous mode, for hit-testing.
+-- @param view table with ReaderView's page_scroll, state, visible_area,
+--             page_states and page_gap fields
+-- @return array of {page=, zoom=, ox=, oy=, top=, bottom=, rotation=}, in
+--         screen order (a single entry outside continuous mode)
+function Geometry.pagePlacements(view)
+    local list = {}
+    if not view then return list end
+    if view.page_scroll then
+        local acc = 0
+        local gap = view.page_gap and view.page_gap.height or 0
+        for _, st in ipairs(view.page_states or {}) do
+            local va, off = st.visible_area, st.offset
+            if va and off and st.zoom and st.zoom > 0 then
+                list[#list + 1] = {
+                    page = st.page,
+                    zoom = st.zoom,
+                    ox = off.x - va.x,
+                    oy = acc + off.y - va.y,
+                    top = acc,
+                    bottom = acc + va.h + off.y,
+                    rotation = st.rotation,
+                }
+                acc = acc + va.h + gap
+            end
+        end
+    else
+        local st, va = view.state, view.visible_area
+        if st and va and st.offset and st.zoom and st.zoom > 0 then
+            list[1] = {
+                page = st.page,
+                zoom = st.zoom,
+                ox = st.offset.x - va.x,
+                oy = st.offset.y - va.y,
+                rotation = st.rotation,
+            }
+        end
+    end
+    return list
+end
+
+--- The placement under screen row y: the page whose band holds it, as
+--- ReaderView:getScrollPagePosition picks it (the last page past the end).
+-- @param placements array from pagePlacements
+-- @param y screen y
+-- @return placement or nil when there is none
+function Geometry.placementAt(placements, y)
+    local n = #placements
+    if n <= 1 then return placements[1] end
+    for i = 1, n do
+        if y < placements[i].bottom then return placements[i] end
+    end
+    return placements[n]
+end
+
+--- The placement of a page, or nil when it isn't on screen.
+function Geometry.placementOf(placements, page)
+    for _, pl in ipairs(placements) do
+        if pl.page == page then return pl end
+    end
+    return nil
+end
+
+--- A string that changes whenever a placement moves or zooms.
+function Geometry.placementKey(pl)
+    return string.format("%s:%.6f:%.3f:%.3f:%s", tostring(pl.page), pl.zoom, pl.ox, pl.oy, tostring(pl.rotation))
+end
+
+--- Screen points to page points, for one placement.
+function Geometry.screenToPage(points, pl)
+    local out = {}
+    for i, p in ipairs(points or {}) do
+        out[i] = { x = (p.x - pl.ox) / pl.zoom, y = (p.y - pl.oy) / pl.zoom }
+    end
+    return out
+end
+
+--- Page points to screen points, for one placement. Rounded to whole pixels,
+--- like the points that come from the stylus.
+function Geometry.pageToScreen(points, pl)
+    local out = {}
+    for i, p in ipairs(points or {}) do
+        out[i] = {
+            x = math.floor(pl.ox + p.x * pl.zoom + 0.5),
+            y = math.floor(pl.oy + p.y * pl.zoom + 0.5),
+        }
+    end
+    return out
+end
+
 --- Number of interpolation steps to rasterize a segment of length `dist`
 --- with a pen of the given width. Steps by ~a quarter of the width, at most
 --- MAX_SEGMENT_STEP px, so wide pens don't paint every pixel ~width times
